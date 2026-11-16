@@ -1,0 +1,9 @@
+/build/
+*.log
+*.asar
+*.asar.unpacked/
+*.exe
+*.zip
+*.pdb
+*.obj
+node_modules/
