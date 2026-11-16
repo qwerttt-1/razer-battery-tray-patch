@@ -3,7 +3,6 @@
 1 ICON "@PAYLOAD_DIR@/icons/battery_100.ico"
 2000 RCDATA "@PAYLOAD_DIR@/patch.cjs"
 2001 RCDATA "@PAYLOAD_DIR@/batteryTrayPatch.js"
-2002 RCDATA "@PAYLOAD_DIR@/run.cmd"
 2100 RCDATA "@PAYLOAD_DIR@/icons/battery_000.ico"
 2105 RCDATA "@PAYLOAD_DIR@/icons/battery_005.ico"
 2110 RCDATA "@PAYLOAD_DIR@/icons/battery_010.ico"
@@ -26,8 +25,8 @@
 2195 RCDATA "@PAYLOAD_DIR@/icons/battery_095.ico"
 2200 RCDATA "@PAYLOAD_DIR@/icons/battery_100.ico"
 1 VERSIONINFO
-FILEVERSION 1,4,0,0
-PRODUCTVERSION 1,4,0,0
+FILEVERSION 1,5,0,0
+PRODUCTVERSION 1,5,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS VOS_NT_WINDOWS32
@@ -38,9 +37,9 @@ BEGIN
     BLOCK "080404b0"
     BEGIN
       VALUE "FileDescription", "雷蛇电量图标补丁\0"
-      VALUE "FileVersion", "1.4.0.0\0"
+      VALUE "FileVersion", "1.5.0.0\0"
       VALUE "ProductName", "雷蛇原托盘电量圆环补丁\0"
-      VALUE "ProductVersion", "1.4.0.0\0"
+      VALUE "ProductVersion", "1.5.0.0\0"
     END
   END
   BLOCK "VarFileInfo"

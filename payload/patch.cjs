@@ -4,18 +4,14 @@ const fs = require(process.versions.electron ? "original-fs" : "node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const cp = require("node:child_process");
-const VERSION = "4.0.896";
-const PATCH_VERSION = "1.4";
-const ORIGINAL_SHA256 = "e7a524aca1771251ca4f851441a97cac1c33929891b291ed34deb7adfc1831ec";
+const vm = require("node:vm");
+const PATCH_VERSION = "1.5";
 const MARKER = "razer-battery-patch.json";
 const MAIN = "electron/main.js";
-const ANCHOR = 'hn=new t(Ao),hn.on("click",Jn)';
-const INSERT = 'hn=new t(Ao),(()=>{try{require("./lib/batteryTrayPatch").attach({tray:hn,storage:b.windowStorage,nativeImage:r,originalImage:Ao,app:e})}catch(error){console.warn("[RazerBatteryTrayPatch] Initialization failed:",error.message)}})(),hn.on("click",Jn)';
-const TOOLTIP_ANCHOR = 'hn.setToolTip("Razer")';
-const TOOLTIP_INSERT = 'hn.setToolTip(require("./lib/batteryTrayPatch").selectState(b.windowStorage,b.lang).tooltip||"Razer")';
 const sha = data => crypto.createHash("sha256").update(data).digest("hex");
 
 function archive(data) {
+  if (data.length < 16) throw new Error("Unsupported ASAR input");
   if (data.readUInt32LE(0) !== 4) throw new Error("Invalid ASAR header");
   const headerSize = data.readUInt32LE(4);
   const header = JSON.parse(data.subarray(16, 16 + data.readUInt32LE(12)).toString("utf8"));
@@ -35,17 +31,49 @@ function archive(data) {
   return { header, base, entry, read };
 }
 
+function versionOf(source) {
+  const version = JSON.parse(source.read("package.json")).version;
+  if (typeof version !== "string" || !/^4\.\d+(?:\.\d+)+(?:[-+][\w.-]+)?$/.test(version)) throw new Error(`Expected Synapse 4.X; found ${version}`);
+  return version;
+}
+
+function transformMain(main) {
+  const id = "[A-Za-z_$][\\w$]*";
+  const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  function binding(property, moduleName) {
+    const groups = [...main.matchAll(/\{([^{}]+)\}\s*=\s*require\(\s*(["'])([^"']+)\2\s*\)/g)].filter(match => match[3] === moduleName);
+    const matches = groups.flatMap(group => [...group[1].matchAll(new RegExp(`(?:^|,)\\s*${property}\\s*(?::\\s*(${id}))?\\s*(?=,|$)`, "g"))]);
+    if (matches.length !== 1) throw new Error(`Unsupported program structure: ${moduleName}.${property} binding is not unique`);
+    return matches[0][1] || property;
+  }
+  const Tray = binding("Tray", "electron");
+  const app = binding("app", "electron");
+  const nativeImage = binding("nativeImage", "electron");
+  const globalVar = binding("globalNodeVar", "./lib/globalNodeVar");
+  const creations = [...main.matchAll(new RegExp(`(${id})\\s*=\\s*new\\s+${escape(Tray)}\\(\\s*(${id})\\s*\\)`, "g"))];
+  if (creations.length !== 1) throw new Error("Unsupported program structure: tray creation is not unique");
+  const [creation, tray, image] = creations[0];
+  const tooltips = [...main.matchAll(new RegExp(`${escape(tray)}\\.setToolTip\\(\\s*(["'])Razer\\1\\s*\\)`, "g"))];
+  if (tooltips.length !== 1 || !main.includes(`${globalVar}.windowStorage`)) throw new Error("Unsupported program structure: tray tooltip or device storage missing");
+  const tooltipInsert = `${tray}.setToolTip(require("./lib/batteryTrayPatch").selectState(${globalVar}.windowStorage,${globalVar}.lang).tooltip||"Razer")`;
+  const insert = `${creation},(()=>{try{require("./lib/batteryTrayPatch").attach({tray:${tray},storage:${globalVar}.windowStorage,nativeImage:${nativeImage},originalImage:${image},app:${app}})}catch(error){console.warn("[RazerBatteryTrayPatch] Initialization failed:",error.message)}})()`;
+  return { main: main.replace(creation, insert).replace(tooltips[0][0], tooltipInsert), tooltipAnchor: tooltips[0][0], tooltipInsert };
+}
+
 function build(original, packageDir = __dirname) {
-  if (sha(original) !== ORIGINAL_SHA256) throw new Error("Unsupported or modified app.asar. Supported original: Synapse 4.0.896 only.");
   const source = archive(original);
-  if (JSON.parse(source.read("package.json")).version !== VERSION) throw new Error("Version mismatch");
+  const version = versionOf(source);
+  if (source.entry(MARKER)) throw new Error("Build requires an unpatched original archive");
   const main = source.read(MAIN).toString("utf8");
-  if (main.split(ANCHOR).length !== 2) throw new Error("Tray creation anchor is not unique");
-  if (main.split(TOOLTIP_ANCHOR).length !== 2) throw new Error("Menu tooltip reset anchor is not unique");
+  const transformed = transformMain(main);
+  new vm.Script(transformed.main, { filename: MAIN });
+  const storagePath = source.entry("electron/modules/window_storage.js") ? "electron/modules/window_storage.js" : "electron/modules/window_storage/index.js";
+  const storage = source.read(storagePath).toString("utf8");
+  if (!["windowStorageMap", "callFunction", "setWindowStorageItem", "removeWindowStorageItem"].every(key => storage.includes(key))) throw new Error("Unsupported program structure: device storage API changed");
   const additions = new Map([
-    [MAIN, Buffer.from(main.replace(ANCHOR, INSERT).replace(TOOLTIP_ANCHOR, TOOLTIP_INSERT))],
+    [MAIN, Buffer.from(transformed.main)],
     ["electron/lib/batteryTrayPatch.js", fs.readFileSync(path.join(packageDir, "batteryTrayPatch.js"))],
-    [MARKER, Buffer.from(JSON.stringify({ version: PATCH_VERSION, synapse: VERSION, step: 5, iconCount: 21, originalSha256: ORIGINAL_SHA256 }))],
+    [MARKER, Buffer.from(JSON.stringify({ version: PATCH_VERSION, synapse: version, step: 5, iconCount: 21, originalSha256: sha(original) }))],
   ]);
   for (let percent = 0; percent <= 100; percent += 5) {
     const filename = `battery_${String(percent).padStart(3, "0")}.ico`;
@@ -133,17 +161,16 @@ async function restart() {
     console.log("Synapse restarted and its main process stayed running.");
   } catch (error) {
     console.error("Startup check failed; requesting restoration of the original resource file.");
-    cp.execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", 'try { $p = Start-Process -FilePath $env:RAZER_PATCH_LAUNCHER -ArgumentList @("restore","elevated") -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { Write-Host $_.Exception.Message; exit 1 }'], {
-      windowsHide: true, env: { ...normalEnv(), RAZER_PATCH_LAUNCHER: path.join(__dirname, "run.cmd") },
+    if (!process.env.RAZER_PATCH_INSTALLER) throw new Error(`Startup failed. Use the installer to restore this installation. ${error.message}`);
+    cp.execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", 'try { $argsLine = \'--worker restore "\' + $env:RAZER_PATCH_TARGET + \'"\'; $p = Start-Process -FilePath $env:RAZER_PATCH_INSTALLER -ArgumentList $argsLine -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { Write-Host $_.Exception.Message; exit 1 }'], {
+      windowsHide: true, env: { ...normalEnv(), RAZER_PATCH_TARGET: process.execPath },
     });
     await start(process.execPath);
     throw new Error(`Original resource file restored after failed startup. ${error.message}`);
   }
 }
 
-async function install(mode) {
-  if (path.basename(process.execPath).toLowerCase() !== "razerappengine.exe") throw new Error("Use the supplied CMD launcher, which uses the installed Razer runtime.");
-  const exe = process.execPath;
+async function install(mode, { exe = process.execPath, stopApp = stop } = {}) {
   const appDir = path.dirname(exe);
   const installedPath = path.join(appDir, "resources", "app.asar");
   const backupDir = path.join(appDir, "resources", "razer-battery-backup");
@@ -152,19 +179,26 @@ async function install(mode) {
   const current = fs.readFileSync(installedPath);
   const currentHash = sha(current);
   const parsed = archive(current);
-  if (JSON.parse(parsed.read("package.json")).version !== VERSION) throw new Error("Unsupported Synapse version");
+  const version = versionOf(parsed);
+  const marker = parsed.entry(MARKER) ? JSON.parse(parsed.read(MARKER)) : null;
   if (mode === "status") {
-    console.log(JSON.stringify({ executable: exe, version: VERSION, sha256: currentHash, patched: !!parsed.entry(MARKER), patchInfo: parsed.entry(MARKER) ? JSON.parse(parsed.read(MARKER)) : null, backupExists: fs.existsSync(backupPath) }, null, 2));
+    console.log(JSON.stringify({ executable: exe, version, sha256: currentHash, patched: !!marker, patchInfo: marker, backupExists: fs.existsSync(backupPath) }, null, 2));
     return;
   }
   let target;
   const previousReceipt = fs.existsSync(receiptPath) ? fs.readFileSync(receiptPath) : null;
+  function originalBackup() {
+    if (!previousReceipt) throw new Error("Patch installation receipt is missing");
+    const recorded = JSON.parse(previousReceipt);
+    if (recorded.installedSha256 !== currentHash) throw new Error("Installed patch has changed; refusing to overwrite it");
+    const original = fs.readFileSync(backupPath);
+    if (!marker?.originalSha256 || recorded.originalSha256 !== marker.originalSha256 || sha(original) !== recorded.originalSha256) throw new Error("Backup hash mismatch");
+    if (versionOf(archive(original)) !== version) throw new Error("Backup belongs to a different Synapse version");
+    return original;
+  }
   if (mode === "apply") {
-    if (parsed.entry(MARKER)) {
-      const recorded = JSON.parse(previousReceipt);
-      if (recorded.installedSha256 !== currentHash) throw new Error("Installed patch has changed; refusing to overwrite it");
-      const original = fs.readFileSync(backupPath);
-      if (sha(original) !== ORIGINAL_SHA256) throw new Error("Backup hash mismatch");
+    if (marker) {
+      const original = originalBackup();
       target = build(original);
       if (sha(target) === currentHash) {
         console.log("This patch version is already installed. Nothing changed.");
@@ -175,27 +209,23 @@ async function install(mode) {
       target = build(current);
       fs.mkdirSync(backupDir, { recursive: true });
       if (!fs.existsSync(backupPath)) fs.copyFileSync(installedPath, backupPath, fs.constants.COPYFILE_EXCL);
-      if (sha(fs.readFileSync(backupPath)) !== ORIGINAL_SHA256) throw new Error("Backup hash mismatch");
+      if (sha(fs.readFileSync(backupPath)) !== currentHash) throw new Error("Existing backup differs from this installation; keep it and check the installation folder");
     }
   } else if (mode === "restore") {
-    if (currentHash === ORIGINAL_SHA256) { console.log("Original version is already installed. Nothing changed."); return; }
-    if (!parsed.entry(MARKER)) throw new Error("This is not our patch. Refusing to overwrite changed application files.");
-    const recorded = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
-    if (recorded.installedSha256 !== currentHash) throw new Error("Installed patch has changed; refusing to overwrite it");
-    target = fs.readFileSync(backupPath);
-    if (sha(target) !== ORIGINAL_SHA256) throw new Error("Backup hash mismatch");
+    if (!marker) { console.log("Original version is already installed. Nothing changed."); return; }
+    target = originalBackup();
   } else throw new Error("Use apply, restore, status, or build");
 
   const targetHash = sha(target);
   console.log(`Verified ${mode} payload. Backup: ${backupPath}`);
-  await stop(exe);
+  await stopApp(exe);
   try {
     fs.writeFileSync(installedPath, target);
     if (sha(fs.readFileSync(installedPath)) !== targetHash) throw new Error("Installed file hash mismatch");
-    if (mode === "apply") fs.writeFileSync(receiptPath, JSON.stringify({ version: PATCH_VERSION, synapse: VERSION, originalSha256: ORIGINAL_SHA256, installedSha256: targetHash, installedAt: new Date().toISOString() }, null, 2));
+    if (mode === "apply") fs.writeFileSync(receiptPath, JSON.stringify({ version: PATCH_VERSION, synapse: version, originalSha256: JSON.parse(archive(target).read(MARKER)).originalSha256, installedSha256: targetHash, installedAt: new Date().toISOString() }, null, 2));
   } catch (error) {
     console.error("Installation failed. Restoring the previous file:", error.message);
-    await stop(exe);
+    await stopApp(exe);
     fs.writeFileSync(installedPath, current);
     if (previousReceipt) fs.writeFileSync(receiptPath, previousReceipt);
     if (sha(fs.readFileSync(installedPath)) !== currentHash) throw new Error("Rollback verification failed. Original backup remains available.");
@@ -213,9 +243,12 @@ if (require.main === module) {
       const result = build(fs.readFileSync(input));
       fs.writeFileSync(output, result, { flag: "wx" });
       console.log(`Built and verified: ${output}\nSHA256 ${sha(result)}`);
-    } else if (mode === "restart") await restart();
-    else await install(mode);
+    } else {
+      if (path.basename(process.execPath).toLowerCase() !== "razerappengine.exe") throw new Error("Run operations through the installer, using the selected Razer runtime.");
+      if (mode === "restart") await restart();
+      else await install(mode);
+    }
   })().catch(error => { console.error("ERROR:", error.message); process.exitCode = 1; });
 }
 
-module.exports = { archive, build, sha, ORIGINAL_SHA256, TOOLTIP_ANCHOR, TOOLTIP_INSERT };
+module.exports = { archive, build, sha, transformMain, install };

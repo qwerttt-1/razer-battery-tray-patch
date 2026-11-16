@@ -2,25 +2,30 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
-constexpr wchar_t CLASS_NAME[] = L"RazerTrayPatchInstaller14";
+constexpr wchar_t CLASS_NAME[] = L"RazerTrayPatchInstaller15";
 constexpr UINT WM_FINISHED = WM_APP + 1;
-constexpr int APPLY = 101, RESTORE = 102, CLOSE = 103;
+constexpr int APPLY = 101, RESTORE = 102, CLOSE = 103, SELECT = 104, FILE_PICK = 105, FOLDER_PICK = 106, RESCAN = 107;
 HINSTANCE instance;
 HWND mainWindow, statusLabel, progressBar, applyButton, restoreButton, closeButton;
+HWND targetCombo, versionLabel, fileButton, folderButton, scanButton;
+std::vector<fs::path> candidates;
 HFONT font, headingFont;
 bool busy = false;
 int dpi = 96;
-fs::path engine, payload;
+fs::path engine, payload, installer;
+std::wstring engineVersion;
 
 struct Result { bool ok; std::wstring message; };
 struct ProcessResult { DWORD code; std::string output; };
@@ -46,12 +51,79 @@ fs::path KnownFolder(REFKNOWNFOLDERID id) {
     return result;
 }
 
-fs::path FindEngine() {
-    for (const auto& id : {FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86}) {
-        auto candidate = KnownFolder(id) / L"Razer/RazerAppEngine/app-4.0.896/RazerAppEngine.exe";
-        if (fs::is_regular_file(candidate)) return candidate;
+bool IsEngine(const fs::path& candidate) {
+    std::error_code error;
+    return _wcsicmp(candidate.filename().c_str(), L"RazerAppEngine.exe") == 0 &&
+        fs::is_regular_file(candidate, error) && fs::is_regular_file(candidate.parent_path() / L"resources/app.asar", error);
+}
+
+void AddEngine(const fs::path& candidate) {
+    if (!IsEngine(candidate)) return;
+    const auto absolute = fs::absolute(candidate).lexically_normal();
+    if (std::none_of(candidates.begin(), candidates.end(), [&](const auto& item) { return _wcsicmp(item.c_str(), absolute.c_str()) == 0; })) candidates.push_back(absolute);
+}
+
+void ScanFolder(const fs::path& folder, int depth = 2) {
+    if (folder.empty()) return;
+    AddEngine(folder / L"RazerAppEngine.exe");
+    if (!depth) return;
+    std::error_code error;
+    for (const auto& item : fs::directory_iterator(folder, fs::directory_options::skip_permission_denied, error)) {
+        if (!item.is_directory(error) || item.is_symlink(error)) continue;
+        ScanFolder(item.path(), depth - 1);
     }
-    return {};
+}
+
+std::wstring RegistryText(HKEY key, const wchar_t* name) {
+    DWORD bytes = 0;
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS || bytes > 65536) return {};
+    std::wstring result(bytes / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, result.data(), &bytes) != ERROR_SUCCESS) return {};
+    result.resize(wcslen(result.c_str()));
+    return result;
+}
+
+void Discover() {
+    candidates.clear();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W item{}; item.dwSize = sizeof(item);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        if (Process32FirstW(snapshot, &item)) do {
+            if (_wcsicmp(item.szExeFile, L"RazerAppEngine.exe")) continue;
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, item.th32ProcessID);
+            if (process) {
+                wchar_t filename[32768]; DWORD length = _countof(filename);
+                if (QueryFullProcessImageNameW(process, 0, filename, &length)) AddEngine(fs::path(filename));
+                CloseHandle(process);
+            }
+        } while (Process32NextW(snapshot, &item));
+        CloseHandle(snapshot);
+    }
+    for (HKEY hive : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) for (REGSAM view : {KEY_WOW64_64KEY, KEY_WOW64_32KEY}) {
+        HKEY uninstall = nullptr;
+        if (RegOpenKeyExW(hive, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ | view, &uninstall) != ERROR_SUCCESS) continue;
+        for (DWORD index = 0;; ++index) {
+            wchar_t name[256]; DWORD length = _countof(name);
+            if (RegEnumKeyExW(uninstall, index, name, &length, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            HKEY app = nullptr;
+            if (RegOpenKeyExW(uninstall, name, 0, KEY_READ | view, &app) != ERROR_SUCCESS) continue;
+            auto display = RegistryText(app, L"DisplayName");
+            std::transform(display.begin(), display.end(), display.begin(), towlower);
+            if (display.find(L"razer") != std::wstring::npos) {
+                ScanFolder(RegistryText(app, L"InstallLocation"));
+                for (const auto* value : {L"DisplayIcon", L"UninstallString"}) {
+                    auto command = RegistryText(app, value);
+                    auto end = command.find(L".exe");
+                    if (end == std::wstring::npos) continue;
+                    auto start = command.front() == L'"' ? 1u : 0u;
+                    ScanFolder(fs::path(command.substr(start, end + 4 - start)).parent_path());
+                }
+            }
+            RegCloseKey(app);
+        }
+        RegCloseKey(uninstall);
+    }
+    for (const auto& id : {FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_LocalAppData}) ScanFolder(KnownFolder(id) / L"Razer/RazerAppEngine");
 }
 
 void ExtractResource(int id, const fs::path& target) {
@@ -67,11 +139,10 @@ void ExtractResource(int id, const fs::path& target) {
 }
 
 void Prepare() {
-    payload = KnownFolder(FOLDERID_LocalAppData) / L"RazerTrayBatteryPatch/installer-1.4";
+    payload = KnownFolder(FOLDERID_LocalAppData) / L"RazerTrayBatteryPatch/installer-1.5";
     fs::create_directories(payload / L"icons");
     ExtractResource(2000, payload / L"patch.cjs");
     ExtractResource(2001, payload / L"batteryTrayPatch.js");
-    ExtractResource(2002, payload / L"run.cmd");
     for (int percent = 0; percent <= 100; percent += 5) {
         wchar_t filename[32];
         swprintf_s(filename, L"battery_%03d.ico", percent);
@@ -105,6 +176,8 @@ std::vector<wchar_t> NodeEnvironment() {
     }
     FreeEnvironmentStringsW(block);
     entries.push_back(L"ELECTRON_RUN_AS_NODE=1");
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [](const auto& value) { return _wcsnicmp(value.c_str(), L"RAZER_PATCH_INSTALLER=", 22) == 0; }), entries.end());
+    entries.push_back(L"RAZER_PATCH_INSTALLER=" + installer.wstring());
     std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
     std::vector<wchar_t> result;
     for (const auto& entry : entries) { result.insert(result.end(), entry.begin(), entry.end()); result.push_back(0); }
@@ -144,17 +217,95 @@ ProcessResult RunNode(const std::wstring& action) {
     return {code, output};
 }
 
+bool Probe() {
+    engineVersion.clear();
+    if (!IsEngine(engine)) return false;
+    const auto result = RunNode(L"status");
+    std::smatch match;
+    if (result.code || !std::regex_search(result.output, match, std::regex("\"version\"\\s*:\\s*\"(4\\.[^\"]+)\""))) return false;
+    engineVersion = Wide(match[1].str());
+    return true;
+}
+
+void FindTargets() {
+    Discover();
+    std::vector<std::pair<fs::path, std::vector<unsigned long>>> supported;
+    for (const auto& candidate : candidates) {
+        engine = candidate;
+        if (!Probe()) continue;
+        std::vector<unsigned long> version;
+        const auto text = engineVersion;
+        const std::wregex digits(L"[0-9]+");
+        for (auto it = std::wsregex_iterator(text.begin(), text.end(), digits); it != std::wsregex_iterator(); ++it) version.push_back(std::stoul(it->str()));
+        supported.push_back({candidate, version});
+    }
+    std::stable_sort(supported.begin(), supported.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    candidates.clear();
+    for (const auto& target : supported) candidates.push_back(target.first);
+}
+
+void UpdateSelection() {
+    const auto index = SendMessageW(targetCombo, CB_GETCURSEL, 0, 0);
+    engine = index >= 0 && static_cast<size_t>(index) < candidates.size() ? candidates[static_cast<size_t>(index)] : fs::path();
+    const bool found = Probe();
+    SetWindowTextW(versionLabel, found ? (L"已识别：Synapse " + engineVersion).c_str() : L"未识别到 Synapse 4 安装，请选择程序或安装文件夹。");
+    SetWindowTextW(statusLabel, found ? L"应用或恢复时需要 Windows 授权，并会重启所选 Synapse。" : L"请选择包含 resources\\app.asar 的 RazerAppEngine.exe。" );
+    EnableWindow(applyButton, found); EnableWindow(restoreButton, found);
+}
+
+void RefreshTargets() {
+    SendMessageW(targetCombo, CB_RESETCONTENT, 0, 0);
+    for (const auto& candidate : candidates) SendMessageW(targetCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(candidate.c_str()));
+    if (!candidates.empty()) SendMessageW(targetCombo, CB_SETCURSEL, 0, 0);
+    UpdateSelection();
+}
+
+void ChooseTarget(bool folder) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+    DWORD options = 0; dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+    dialog->SetTitle(folder ? L"选择 Synapse 或 RazerAppEngine 安装文件夹" : L"选择 RazerAppEngine.exe");
+    const COMDLG_FILTERSPEC filter[] = {{L"RazerAppEngine.exe", L"RazerAppEngine.exe"}};
+    if (!folder) dialog->SetFileTypes(1, filter);
+    if (SUCCEEDED(dialog->Show(mainWindow))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR selected = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &selected))) {
+                auto previous = candidates;
+                candidates.clear();
+                if (folder) ScanFolder(selected); else AddEngine(selected);
+                if (candidates.empty()) {
+                    candidates = previous;
+                    MessageBoxW(mainWindow, L"此位置未找到 RazerAppEngine.exe 及其 resources\\app.asar，请选择 Synapse 的安装位置。", L"未找到程序", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    const auto chosen = candidates;
+                    candidates = previous;
+                    for (const auto& candidate : chosen) AddEngine(candidate);
+                    RefreshTargets();
+                    const auto position = std::find(candidates.begin(), candidates.end(), chosen.front()) - candidates.begin();
+                    SendMessageW(targetCombo, CB_SETCURSEL, position, 0);
+                    UpdateSelection();
+                }
+                CoTaskMemFree(selected);
+            }
+            item->Release();
+        }
+    }
+    dialog->Release();
+}
+
 Result Operate(const std::wstring& action) {
     const fs::path logPath = payload / L"patch-result.log";
     const auto before = fs::exists(logPath) ? fs::file_size(logPath) : 0;
-    std::wstring worker = (payload / L"run.cmd").wstring();
-    std::wstring arguments = action + L" elevated";
+    std::wstring arguments = L"--worker " + action + L" " + Quote(engine.wstring());
     SHELLEXECUTEINFOW shell{};
     shell.cbSize = sizeof(shell);
     shell.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
     shell.hwnd = mainWindow;
     shell.lpVerb = L"runas";
-    shell.lpFile = worker.c_str();
+    shell.lpFile = installer.c_str();
     shell.lpParameters = arguments.c_str();
     shell.lpDirectory = payload.c_str();
     shell.nShow = SW_HIDE;
@@ -194,24 +345,34 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         headingFont = CreateFontW(-Scale(22), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         HWND heading = Control(L"STATIC", L"雷蛇电量图标补丁", 0, 26, 23, 470, 36);
         SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont), TRUE);
-        Control(L"STATIC", L"适用：Razer Synapse 4.0.896  ·  补丁 1.4", 0, 26, 67, 470, 24);
+        Control(L"STATIC", L"Razer Synapse 4  ·  补丁 1.5", 0, 26, 67, 630, 24);
         Control(L"STATIC", L"21 档电量圆环，40 像素原始图案。\r\n悬停显示实际电量，保留原来的点击和菜单。", 0, 26, 104, 470, 50);
-        statusLabel = Control(L"STATIC", engine.empty() ? L"未找到受支持的 Synapse 4.0.896 安装。" : L"应用或恢复时需要 Windows 授权，并会重启 Synapse。", 0, 26, 174, 470, 50);
-        progressBar = Control(PROGRESS_CLASSW, L"", PBS_MARQUEE, 26, 234, 470, 6);
+        targetCombo = Control(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 26, 169, 630, 180, SELECT);
+        SendMessageW(targetCombo, CB_SETHORIZONTALEXTENT, Scale(1800), 0);
+        fileButton = Control(L"BUTTON", L"选择程序…", WS_TABSTOP, 26, 210, 150, 34, FILE_PICK);
+        folderButton = Control(L"BUTTON", L"选择文件夹…", WS_TABSTOP, 190, 210, 150, 34, FOLDER_PICK);
+        scanButton = Control(L"BUTTON", L"重新检测", WS_TABSTOP, 354, 210, 142, 34, RESCAN);
+        versionLabel = Control(L"STATIC", L"", 0, 26, 258, 630, 28);
+        statusLabel = Control(L"STATIC", L"", 0, 26, 300, 630, 60);
+        progressBar = Control(PROGRESS_CLASSW, L"", PBS_MARQUEE, 26, 370, 630, 6);
         ShowWindow(progressBar, SW_HIDE);
-        applyButton = Control(L"BUTTON", L"应用补丁", WS_TABSTOP | BS_DEFPUSHBUTTON, 26, 260, 150, 40, APPLY);
-        restoreButton = Control(L"BUTTON", L"恢复原版", WS_TABSTOP, 190, 260, 150, 40, RESTORE);
-        closeButton = Control(L"BUTTON", L"关闭", WS_TABSTOP, 354, 260, 142, 40, CLOSE);
-        EnableWindow(applyButton, !engine.empty());
-        EnableWindow(restoreButton, !engine.empty());
+        applyButton = Control(L"BUTTON", L"应用补丁", WS_TABSTOP | BS_DEFPUSHBUTTON, 26, 396, 150, 40, APPLY);
+        restoreButton = Control(L"BUTTON", L"恢复原版", WS_TABSTOP, 190, 396, 150, 40, RESTORE);
+        closeButton = Control(L"BUTTON", L"关闭", WS_TABSTOP, 514, 396, 142, 40, CLOSE);
+        RefreshTargets();
         return 0;
     }
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
+        if (busy) break;
+        if (id == SELECT && HIWORD(wParam) == CBN_SELCHANGE) { UpdateSelection(); return 0; }
+        if (id == FILE_PICK || id == FOLDER_PICK) { ChooseTarget(id == FOLDER_PICK); return 0; }
+        if (id == RESCAN) { FindTargets(); RefreshTargets(); return 0; }
         if (id == CLOSE) { SendMessageW(window, WM_CLOSE, 0, 0); return 0; }
         if ((id != APPLY && id != RESTORE) || busy) break;
         busy = true;
         EnableWindow(applyButton, FALSE); EnableWindow(restoreButton, FALSE); EnableWindow(closeButton, FALSE);
+        for (auto control : {targetCombo, fileButton, folderButton, scanButton}) EnableWindow(control, FALSE);
         SetWindowTextW(statusLabel, L"正在处理，请在 Windows 权限提示中允许操作。\r\n完成后此窗口会显示结果。" );
         ShowWindow(progressBar, SW_SHOW);
         SendMessageW(progressBar, PBM_SETMARQUEE, TRUE, 30);
@@ -231,6 +392,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         ShowWindow(progressBar, SW_HIDE);
         SendMessageW(progressBar, PBM_SETMARQUEE, FALSE, 0);
         EnableWindow(applyButton, TRUE); EnableWindow(restoreButton, TRUE); EnableWindow(closeButton, TRUE);
+        for (auto control : {targetCombo, fileButton, folderButton, scanButton}) EnableWindow(control, TRUE);
         SetWindowTextW(statusLabel, result->message.c_str());
         if (!result->ok) MessageBoxW(window, result->message.c_str(), L"未完成操作", MB_OK | MB_ICONWARNING);
         return 0;
@@ -253,12 +415,26 @@ int WINAPI wWinMain(HINSTANCE current, HINSTANCE, PWSTR, int show) {
     instance = current;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     try {
+        wchar_t executable[32768];
+        GetModuleFileNameW(nullptr, executable, _countof(executable));
+        installer = executable;
         Prepare();
-        engine = FindEngine();
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        if (argc == 3 && std::wstring(argv[1]) == L"--self-test") {
-            if (engine.empty()) throw std::runtime_error("Supported Razer runtime not found");
+        if (argc == 4 && std::wstring(argv[1]) == L"--worker") {
+            std::wstring action(argv[2]); engine = argv[3];
+            if ((action != L"apply" && action != L"restore") || !Probe()) return 1;
+            auto result = RunNode(action);
+            std::ofstream log(payload / L"patch-result.log", std::ios::binary | std::ios::app);
+            log << result.output;
+            LocalFree(argv);
+            return static_cast<int>(result.code);
+        }
+        FindTargets();
+        engine = candidates.empty() ? fs::path() : candidates.front();
+        if ((argc == 3 || argc == 4) && std::wstring(argv[1]) == L"--self-test") {
+            if (argc == 4) engine = argv[3];
+            if (!Probe()) return 1;
             auto result = RunNode(L"status");
             std::ofstream log(fs::path(argv[2]), std::ios::binary);
             log << result.output;
@@ -281,7 +457,7 @@ int WINAPI wWinMain(HINSTANCE current, HINSTANCE, PWSTR, int show) {
     cls.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     cls.lpszClassName = CLASS_NAME;
     RegisterClassW(&cls);
-    RECT size{0, 0, Scale(522), Scale(324)};
+    RECT size{0, 0, Scale(682), Scale(460)};
     AdjustWindowRectEx(&size, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
     HWND window = CreateWindowExW(0, CLASS_NAME, L"雷蛇电量图标补丁", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, size.right - size.left, size.bottom - size.top, nullptr, nullptr, instance, nullptr);
     if (!window) return 1;

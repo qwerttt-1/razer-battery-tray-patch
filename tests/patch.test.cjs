@@ -4,7 +4,35 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const helper = require("../payload/batteryTrayPatch.js");
-const { TOOLTIP_ANCHOR, TOOLTIP_INSERT, build } = require("../payload/patch.cjs");
+const { archive, transformMain, install, sha, build } = require("../payload/patch.cjs");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+function mainFixture({ tray = "hn", Tray = "t", app = "e", image = "Ao", nativeImage = "r", globalVar = "b" } = {}) {
+  return `const {app:${app},Tray:${Tray},nativeImage:${nativeImage}}=require("electron"),{globalNodeVar:${globalVar}}=require("./lib/globalNodeVar");let ${tray};const ${image}="icon";${tray}=new ${Tray}(${image}),${tray}.on("click",()=>{});${tray}.setToolTip("Razer");void ${globalVar}.windowStorage;`;
+}
+const { tooltipAnchor: TOOLTIP_ANCHOR, tooltipInsert: TOOLTIP_INSERT } = transformMain(mainFixture());
+
+// Minimal invented fixtures exercise the archive format without shipping vendor files.
+function pack(files) {
+  const header = { files: {} }, bodies = [];
+  let offset = 0;
+  for (const [name, value] of Object.entries(files)) {
+    const bytes = Buffer.from(value);
+    const parts = name.split("/"); let node = header;
+    for (const part of parts.slice(0,-1)) node = (node.files[part] ||= { files: {} });
+    node.files[parts.at(-1)] = { size: bytes.length, offset: String(offset) };
+    offset += bytes.length; bodies.push(bytes);
+  }
+  const json = Buffer.from(JSON.stringify(header));
+  const hp = Buffer.alloc(8 + Math.ceil(json.length/4)*4); hp.writeUInt32LE(hp.length-4); hp.writeUInt32LE(json.length,4); json.copy(hp,8);
+  const sp = Buffer.alloc(8); sp.writeUInt32LE(4); sp.writeUInt32LE(hp.length,4);
+  return Buffer.concat([sp,hp,...bodies]);
+}
+function fixture(version = "4.2.1200", aliases) {
+  return pack({ "package.json": JSON.stringify({ version }), "electron/main.js": mainFixture(aliases), "electron/modules/window_storage/index.js": "windowStorageMap callFunction setWindowStorageItem removeWindowStorageItem" });
+}
 
 function state(level, chargingStatus = "NoCharge_BatteryFull") {
   return { hasBattery: true, name: { en: "Razer Mouse" }, powerStatus: { level, chargingStatus } };
@@ -61,4 +89,54 @@ test("menu rebuild tooltip expression fixes the original overwrite", () => {
 
 test("unknown archive inputs are rejected before any installation",()=>{
   assert.throws(()=>build(Buffer.from("unsupported")),/Unsupported/);
+});
+
+test("4.X versions and renamed minified bindings are patched without fixed hashes", () => {
+  for (const version of ["4.0.896", "4.2.1200", "4.99.1"]) {
+    const original = fixture(version, {tray:"$tray",Tray:"TT",app:"application",image:"logo",nativeImage:"ni",globalVar:"gv"});
+    const result = archive(build(original));
+    assert.equal(JSON.parse(result.read("razer-battery-patch.json")).synapse,version);
+    assert.equal(JSON.parse(result.read("razer-battery-patch.json")).originalSha256,sha(original));
+    let attached;
+    class Tray extends EventEmitter { setToolTip() {} }
+    vm.runInNewContext(result.read("electron/main.js").toString(), { require: name => {
+      if (name === "electron") return {Tray,app:{},nativeImage:{}};
+      if (name === "./lib/globalNodeVar") return {globalNodeVar:{windowStorage:{}}};
+      return {attach:value=>{attached=value;},selectState:()=>({tooltip:"79%"})};
+    }});
+    assert.equal(attached.originalImage,"icon"); assert.ok(attached.tray instanceof Tray);
+  }
+});
+
+test("changed architecture, ambiguous anchors and other major versions stop before patching", () => {
+  assert.throws(()=>build(fixture("5.0.1")),/Expected Synapse 4/);
+  assert.throws(()=>transformMain(mainFixture()+'hn=new t(Ao);'),/not unique/);
+  assert.throws(()=>transformMain(mainFixture().replace('hn.setToolTip("Razer")','hn.setToolTip("Changed")')),/structure/);
+  assert.throws(()=>build(pack({"package.json":'{"version":"4.1.1"}',"electron/main.js":mainFixture(),"electron/modules/window_storage/index.js":"different API"})),/storage API/);
+});
+
+test("apply, repeat, legacy upgrade and restore keep each installation's own backup", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(),"Razer 补丁测试 "));
+  const exe = path.join(folder,"RazerAppEngine.exe"), resources = path.join(folder,"resources");
+  fs.mkdirSync(resources);
+  const installed = path.join(resources,"app.asar");
+  const original = fixture("4.7.123"); fs.writeFileSync(installed,original);
+  let stops = 0; const options = {exe,stopApp:async()=>{stops++;}};
+  await install("apply", options);
+  const patched = fs.readFileSync(installed);
+  await install("apply", options); assert.equal(stops,1); assert.deepEqual(fs.readFileSync(installed),patched);
+  const backupDir = path.join(resources,"razer-battery-backup");
+  const receiptPath = path.join(backupDir,"install.json");
+  // A 1.4 receipt and marker used the same original/installed hash contract.
+  const parsed = archive(patched), marker = JSON.parse(parsed.read("razer-battery-patch.json")); marker.version="1.4";
+  const legacy = pack({"package.json":parsed.read("package.json"),"electron/main.js":parsed.read("electron/main.js"),"razer-battery-patch.json":JSON.stringify(marker)});
+  fs.writeFileSync(installed,legacy);
+  const receipt = JSON.parse(fs.readFileSync(receiptPath)); receipt.version="1.4";receipt.installedSha256=sha(legacy);fs.writeFileSync(receiptPath,JSON.stringify(receipt));
+  await install("apply",options); assert.deepEqual(fs.readFileSync(installed),patched);
+  fs.appendFileSync(path.join(backupDir,"original-app.asar"),"tampered");
+  await assert.rejects(install("restore",options),/Backup hash mismatch/);assert.equal(stops,2);
+  fs.writeFileSync(path.join(backupDir,"original-app.asar"),original);
+  await install("restore",options);assert.deepEqual(fs.readFileSync(installed),original);
+  await install("restore",options);assert.equal(stops,3);
+  // Retain test files for inspection; tests never remove user files.
 });

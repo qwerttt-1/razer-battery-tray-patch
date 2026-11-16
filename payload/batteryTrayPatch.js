@@ -97,7 +97,7 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
 
   storage.callFunction = wrapped;
   app.once("before-quit", dispose);
-  console.log(PREFIX, "Installed 1.4 (Synapse 4.0.896, tooltip survives menu rebuild, 21 icons, 49-51%=50%; above ceil/below floor, storage events, no polling)");
+  console.log(PREFIX, "Installed 1.5 (21 icons, 49-51%=50%; above ceil/below floor, storage events, no polling)");
   refresh();
   return { refresh, dispose };
 }
