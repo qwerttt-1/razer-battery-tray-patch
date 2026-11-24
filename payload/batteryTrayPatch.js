@@ -2,6 +2,7 @@
 
 const path = require("node:path");
 const PREFIX = "[RazerBatteryTrayPatch]";
+const batteryReadings = new WeakMap();
 
 function localizedName(device, locale) {
   for (const field of [device.productName, device.editionName, device.name]) {
@@ -15,8 +16,10 @@ function localizedName(device, locale) {
 }
 
 function selectState(storage, locale = "en") {
+  const previousReadings = batteryReadings.get(storage);
+  const readings = new Map();
   const devices = [];
-  for (const values of storage.windowStorageMap.values()) {
+  for (const [key, values] of storage.windowStorageMap) {
     const raw = values.get("connectedDevices");
     if (raw === undefined) continue;
     let device;
@@ -24,9 +27,21 @@ function selectState(storage, locale = "en") {
     catch { continue; }
     if (!device || device.hasBattery === false || !device.powerStatus) continue;
     const { level, chargingStatus } = device.powerStatus;
-    if (typeof level !== "number" || !Number.isFinite(level) || level < 0 || level > 100 || chargingStatus === "off") continue;
-    devices.push({ name: localizedName(device, locale), percent: level, charging: chargingStatus === "Charging" });
+    const lastReported = chargingStatus === "off";
+    const productId = device.realProductId ?? device.productId;
+    const previous = previousReadings?.get(key);
+    if (lastReported && (!previous || previous.productId !== productId)) continue;
+    const percent = lastReported ? previous.percent : level;
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) continue;
+    readings.set(key, { productId, percent });
+    devices.push({
+      name: localizedName(device, locale),
+      percent,
+      charging: chargingStatus === "Charging",
+      lastReported,
+    });
   }
+  batteryReadings.set(storage, readings);
   if (!devices.length) return { bucket: null, tooltip: "", devices: [] };
   devices.sort((a, b) => a.percent - b.percent || a.name.localeCompare(b.name));
   const percent = devices[0].percent;
@@ -35,7 +50,10 @@ function selectState(storage, locale = "en") {
   else if (percent > 51) bucket = Math.ceil(percent / 5) * 5;
   return {
     bucket,
-    tooltip: ("Razer Synapse\n" + devices.map(d => `${d.name}: ${d.percent}%${d.charging ? " (Charging)" : ""}`).join("\n")).slice(0, 127),
+    tooltip: ("Razer Synapse\n" + devices.map(d => {
+      const status = d.lastReported ? " (Last reported)" : d.charging ? " (Charging)" : "";
+      return `${d.name}: ${d.percent}%${status}`;
+    }).join("\n")).slice(0, 127),
     devices,
   };
 }
@@ -97,7 +115,7 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
 
   storage.callFunction = wrapped;
   app.once("before-quit", dispose);
-  console.log(PREFIX, "Installed 1.5 (21 icons, 49-51%=50%; above ceil/below floor, storage events, no polling)");
+  console.log(PREFIX, "Installed 1.6.1 (21 icons, preserves last reported battery when off, storage events, no polling)");
   refresh();
   return { refresh, dispose };
 }

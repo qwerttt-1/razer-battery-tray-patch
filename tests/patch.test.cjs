@@ -54,7 +54,7 @@ test("all 101 integer percentages follow the documented ranges", () => {
 });
 
 test("lowest valid connected battery is selected", () => {
-  const result = helper.selectState(storageFor(state(79),state(22),state(1,"off"),state(null),state(101)));
+  const result = helper.selectState(storageFor(state(79),state(22),state(null,"off"),state(null),state(101)));
   assert.equal(result.bucket,20);
   assert.equal(result.devices.length,2);
   assert.equal(helper.selectState(storageFor()).bucket,null);
@@ -85,6 +85,53 @@ test("menu rebuild tooltip expression fixes the original overwrite", () => {
   storage.windowStorageMap.clear(); hooks.refresh(); vm.runInNewContext(TOOLTIP_INSERT,context);
   assert.equal(tip,"Razer");
   hooks.dispose();
+});
+
+test("sleep preserves the last reported battery until a new reading or device removal", async () => {
+  const storage = storageFor(state(0, "off"));
+  storage.callFunction = (_event, { action, payload }) => {
+    if (action === "removeWindowStorageItem") storage.windowStorageMap.get("0").delete(payload.key);
+    else storage.windowStorageMap.get("0").set(payload.key, payload.value);
+  };
+  const images = [];
+  let tooltip;
+  const tray = {
+    isDestroyed: () => false,
+    setImage: value => images.push(value),
+    setToolTip: value => { tooltip = value; },
+  };
+  const app = new EventEmitter();
+  app.getLocale = () => "en";
+  const nativeImage = { createFromPath: file => ({ file, isEmpty: () => false }) };
+  const originalImage = "original";
+  const hooks = helper.attach({ tray, storage, app, nativeImage, originalImage });
+  const update = async (device) => {
+    const action = device ? "setWindowStorageItem" : "removeWindowStorageItem";
+    await storage.callFunction(null, { action, payload: { key: "connectedDevices", value: JSON.stringify(device) } });
+  };
+  try {
+    assert.deepEqual(images, [originalImage]);
+    assert.equal(tooltip, "");
+    await update(state(69));
+    assert.match(images.at(-1).file, /battery_070\.ico$/);
+    await update(state(0, "off"));
+    assert.equal(images.length, 2);
+    assert.match(tooltip, /69% \(Last reported\)/);
+    const context = { hn: tray, b: { windowStorage: storage, lang: "en" }, require: () => helper };
+    vm.runInNewContext(TOOLTIP_INSERT, context);
+    assert.match(tooltip, /69% \(Last reported\)/);
+    await update(state(64));
+    assert.match(images.at(-1).file, /battery_065\.ico$/);
+    assert.match(tooltip, /64%$/);
+    await update();
+    assert.equal(images.at(-1), originalImage);
+    assert.equal(tooltip, "");
+    await update(state(69, "off"));
+    assert.equal(images.at(-1), originalImage);
+    assert.equal(tooltip, "");
+  } finally {
+    hooks.dispose();
+  }
 });
 
 test("unknown archive inputs are rejected before any installation",()=>{

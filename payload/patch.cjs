@@ -5,7 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const cp = require("node:child_process");
 const vm = require("node:vm");
-const PATCH_VERSION = "1.5";
+const PATCH_VERSION = "1.6.1";
 const MARKER = "razer-battery-patch.json";
 const MAIN = "electron/main.js";
 const sha = data => crypto.createHash("sha256").update(data).digest("hex");
