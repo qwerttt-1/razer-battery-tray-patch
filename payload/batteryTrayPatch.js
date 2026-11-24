@@ -62,27 +62,60 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
   const originalCall = storage.callFunction;
   let stopped = false;
   let queued = false;
-  let bucket;
+  let baseBucket;
+  let displayedBucket;
   let tooltip;
-  let image = null;
+  let animation;
+  const images = new Map();
   const locale = app.getLocale();
 
+  function showBucket(bucket) {
+    if (bucket === displayedBucket) return;
+    let image = originalImage;
+    if (bucket !== null) {
+      image = images.get(bucket);
+      if (!image) {
+        const filename = `battery_${String(bucket).padStart(3, "0")}.ico`;
+        image = nativeImage.createFromPath(path.join(__dirname, "../resources/images/battery-tray", filename));
+        if (image.isEmpty()) throw new Error(`Cannot load ${filename}`);
+        images.set(bucket, image);
+      }
+    }
+    tray.setImage(image);
+    displayedBucket = bucket;
+  }
+
+  function stopAnimation() {
+    clearInterval(animation);
+    animation = undefined;
+  }
+
+  function advanceFrame() {
+    if (stopped || tray.isDestroyed()) {
+      stopAnimation();
+      return;
+    }
+    try {
+      showBucket(displayedBucket === 100 ? baseBucket : displayedBucket + 5);
+    } catch (error) {
+      stopAnimation();
+      console.warn(PREFIX, "Charging animation failed:", error.message);
+    }
+  }
+
   function refresh() {
-    if (stopped || tray.isDestroyed()) return;
+    if (stopped || tray.isDestroyed()) {
+      stopAnimation();
+      return;
+    }
     try {
       const state = selectState(storage, locale);
-      if (state.bucket !== bucket) {
-        if (state.bucket === null) {
-          tray.setImage(originalImage);
-          image = null;
-        } else {
-          const filename = `battery_${String(state.bucket).padStart(3, "0")}.ico`;
-          const next = nativeImage.createFromPath(path.join(__dirname, "../resources/images/battery-tray", filename));
-          if (next.isEmpty()) throw new Error(`Cannot load ${filename}`);
-          tray.setImage(next);
-          image = next;
-        }
-        bucket = state.bucket;
+      const animate = state.devices[0]?.charging && state.bucket < 100;
+      if (animation && (state.bucket !== baseBucket || !animate)) stopAnimation();
+      if (!animation) {
+        showBucket(state.bucket);
+        baseBucket = state.bucket;
+        if (animate) animation = setInterval(advanceFrame, 500);
       }
       if (state.tooltip !== tooltip) {
         tray.setToolTip(state.tooltip);
@@ -108,14 +141,15 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
 
   function dispose() {
     stopped = true;
+    stopAnimation();
     if (storage.callFunction === wrapped) storage.callFunction = originalCall;
     app.removeListener("before-quit", dispose);
-    image = null;
+    images.clear();
   }
 
   storage.callFunction = wrapped;
   app.once("before-quit", dispose);
-  console.log(PREFIX, "Installed 1.6.1 (21 icons, preserves last reported battery when off, storage events, no polling)");
+  console.log(PREFIX, "Installed 1.7.0 (21 icons, charging animation, last reported battery when off)");
   refresh();
   return { refresh, dispose };
 }

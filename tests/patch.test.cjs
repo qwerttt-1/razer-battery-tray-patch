@@ -66,6 +66,87 @@ test("charging text reflects exact battery rather than the icon bucket", () => {
   assert.match(result.tooltip,/78% \(Charging\)/);
 });
 
+test("charging animates every 500 ms from the current bucket and stops when charging ends", () => {
+  const modulePath = require.resolve("../payload/batteryTrayPatch.js");
+  const module = { exports: {} };
+  const timers = new Map();
+  let nextTimer = 0;
+  vm.runInNewContext(fs.readFileSync(modulePath, "utf8"), {
+    module, require, __dirname: path.dirname(modulePath), console,
+    setInterval(callback, delay) {
+      assert.equal(delay, 500);
+      timers.set(++nextTimer, callback);
+      return nextTimer;
+    },
+    clearInterval: timer => timers.delete(timer),
+  });
+  const storage = storageFor(state(78, "Charging"));
+  const app = new EventEmitter();
+  app.getLocale = () => "en";
+  const frames = [], loaded = [];
+  let tooltip;
+  const tray = {
+    isDestroyed: () => false,
+    setImage: image => frames.push(image.name ?? image),
+    setToolTip: value => { tooltip = value; },
+  };
+  const nativeImage = {
+    createFromPath(file) {
+      const name = path.basename(file);
+      loaded.push(name);
+      return { name, isEmpty: () => false };
+    },
+  };
+  const hooks = module.exports.attach({ tray, storage, nativeImage, originalImage: "original", app });
+  function update(...devices) {
+    storage.windowStorageMap = storageFor(...devices).windowStorageMap;
+    hooks.refresh();
+  }
+  function tick() {
+    assert.equal(timers.size, 1);
+    timers.values().next().value();
+  }
+  try {
+    assert.equal(frames.at(-1), "battery_080.ico");
+    tick();
+    update(state(79, "Charging"));
+    assert.equal(frames.at(-1), "battery_085.ico");
+    for (let step = 0; step < 4; step++) tick();
+    assert.deepEqual(frames, [80, 85, 90, 95, 100, 80].map(level => `battery_${String(level).padStart(3, "0")}.ico`));
+    assert.equal(loaded.length, 5);
+    assert.match(tooltip, /79% \(Charging\)/);
+    update(state(86, "Charging"));
+    assert.equal(frames.at(-1), "battery_090.ico");
+    tick();
+    update(state(86));
+    assert.equal(timers.size, 0);
+    assert.equal(frames.at(-1), "battery_090.ico");
+    update(state(99, "Charging"));
+    assert.equal(timers.size, 0);
+    assert.equal(frames.at(-1), "battery_100.ico");
+    update(state(60), state(70, "Charging"));
+    assert.equal(timers.size, 0);
+    assert.equal(frames.at(-1), "battery_060.ico");
+    update(state(86, "Charging"));
+    tick();
+    update(state(0, "off"));
+    assert.equal(timers.size, 0);
+    assert.equal(frames.at(-1), "battery_090.ico");
+    assert.match(tooltip, /86% \(Last reported\)/);
+    update(state(86, "Charging"));
+    tick();
+    update();
+    assert.equal(timers.size, 0);
+    assert.equal(frames.at(-1), "original");
+    update(state(86, "Charging"));
+  } finally {
+    app.emit("before-quit");
+  }
+  assert.equal(timers.size, 0);
+  assert.equal(storage.callFunction, undefined);
+  hooks.dispose();
+});
+
 test("menu rebuild tooltip expression fixes the original overwrite", () => {
   const storage = storageFor(state(79));
   const app = new EventEmitter(); app.getLocale=()=>"en";
