@@ -2,6 +2,7 @@
 
 const path = require("node:path");
 const PREFIX = "[RazerBatteryTrayPatch]";
+const WAKE_SETTLE_MS = 3000;
 const batteryReadings = new WeakMap();
 
 function localizedName(device, locale) {
@@ -19,6 +20,8 @@ function selectState(storage, locale = "en") {
   const previousReadings = batteryReadings.get(storage);
   const readings = new Map();
   const devices = [];
+  const now = Date.now();
+  let nextRefreshAt = 0;
   for (const [key, values] of storage.windowStorageMap) {
     const raw = values.get("connectedDevices");
     if (raw === undefined) continue;
@@ -27,13 +30,22 @@ function selectState(storage, locale = "en") {
     catch { continue; }
     if (!device || device.hasBattery === false || !device.powerStatus) continue;
     const { level, chargingStatus } = device.powerStatus;
-    const lastReported = chargingStatus === "off";
+    const off = chargingStatus === "off";
     const productId = device.realProductId ?? device.productId;
-    const previous = previousReadings?.get(key);
-    if (lastReported && (!previous || previous.productId !== productId)) continue;
+    let previous = previousReadings?.get(key);
+    if (previous?.productId !== productId) previous = undefined;
+    if (off && !previous) continue;
+    // Synapse can announce 100% on wake before it reads the battery.
+    let wakeUntil = 0;
+    if (level === 100 && chargingStatus === "NoCharge_BatteryFull" && previous?.percent < 100) {
+      wakeUntil = previous.off ? now + WAKE_SETTLE_MS : previous.wakeUntil;
+    }
+    const waitingForBattery = wakeUntil > now;
+    const lastReported = off || waitingForBattery;
     const percent = lastReported ? previous.percent : level;
     if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) continue;
-    readings.set(key, { productId, percent });
+    readings.set(key, { productId, percent, off, wakeUntil });
+    if (waitingForBattery && (!nextRefreshAt || wakeUntil < nextRefreshAt)) nextRefreshAt = wakeUntil;
     devices.push({
       name: localizedName(device, locale),
       percent,
@@ -50,6 +62,7 @@ function selectState(storage, locale = "en") {
   else if (percent > 51) bucket = Math.ceil(percent / 5) * 5;
   return {
     bucket,
+    nextRefreshAt,
     tooltip: ("Razer Synapse\n" + devices.map(d => {
       const status = d.lastReported ? " (Last reported)" : d.charging ? " (Charging)" : "";
       return `${d.name}: ${d.percent}%${status}`;
@@ -66,6 +79,8 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
   let displayedBucket;
   let tooltip;
   let animation;
+  let wakeTimer;
+  let wakeAt = 0;
   const images = new Map();
   const locale = app.getLocale();
 
@@ -103,13 +118,27 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
     }
   }
 
+  function scheduleWakeCheck(deadline = 0) {
+    if (deadline === wakeAt) return;
+    clearTimeout(wakeTimer);
+    wakeAt = deadline;
+    if (deadline) {
+      wakeTimer = setTimeout(() => {
+        wakeAt = 0;
+        refresh();
+      }, Math.max(0, deadline - Date.now()));
+    }
+  }
+
   function refresh() {
     if (stopped || tray.isDestroyed()) {
       stopAnimation();
+      scheduleWakeCheck();
       return;
     }
     try {
       const state = selectState(storage, locale);
+      scheduleWakeCheck(state.nextRefreshAt);
       const animate = state.devices[0]?.charging && state.bucket < 100;
       if (animation && (state.bucket !== baseBucket || !animate)) stopAnimation();
       if (!animation) {
@@ -142,6 +171,7 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
   function dispose() {
     stopped = true;
     stopAnimation();
+    scheduleWakeCheck();
     if (storage.callFunction === wrapped) storage.callFunction = originalCall;
     app.removeListener("before-quit", dispose);
     images.clear();
@@ -149,7 +179,7 @@ function attach({ tray, storage, nativeImage, originalImage, app }) {
 
   storage.callFunction = wrapped;
   app.once("before-quit", dispose);
-  console.log(PREFIX, "Installed 1.7.0 (21 icons, charging animation, last reported battery when off)");
+  console.log(PREFIX, "Installed 1.7.1 (21 icons, charging animation, preserves battery during wake)");
   refresh();
   return { refresh, dispose };
 }

@@ -139,7 +139,7 @@ void ExtractResource(int id, const fs::path& target) {
 }
 
 void Prepare() {
-    payload = KnownFolder(FOLDERID_LocalAppData) / L"RazerTrayBatteryPatch/installer-1.7.0";
+    payload = KnownFolder(FOLDERID_LocalAppData) / L"RazerTrayBatteryPatch/installer-1.7.1";
     fs::create_directories(payload / L"icons");
     ExtractResource(2000, payload / L"patch.cjs");
     ExtractResource(2001, payload / L"batteryTrayPatch.js");
@@ -345,7 +345,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         headingFont = CreateFontW(-Scale(22), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         HWND heading = Control(L"STATIC", L"雷蛇电量图标补丁", 0, 26, 23, 470, 36);
         SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont), TRUE);
-        Control(L"STATIC", L"Razer Synapse 4  ·  补丁 1.7.0", 0, 26, 67, 630, 24);
+        Control(L"STATIC", L"Razer Synapse 4  ·  补丁 1.7.1", 0, 26, 67, 630, 24);
         Control(L"STATIC", L"21 档电量圆环，40 像素原始图案。\r\n悬停显示实际电量，保留原来的点击和菜单。", 0, 26, 104, 470, 50);
         targetCombo = Control(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 26, 169, 630, 180, SELECT);
         SendMessageW(targetCombo, CB_SETHORIZONTALEXTENT, Scale(1800), 0);

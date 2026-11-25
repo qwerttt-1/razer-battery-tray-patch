@@ -215,6 +215,67 @@ test("sleep preserves the last reported battery until a new reading or device re
   }
 });
 
+test("wake keeps the last reading through a transient 100% and accepts a sustained 100%", () => {
+  const modulePath = require.resolve("../payload/batteryTrayPatch.js");
+  const module = { exports: {} };
+  const timers = new Map();
+  let now = 10000;
+  let nextTimer = 0;
+  vm.runInNewContext(fs.readFileSync(modulePath, "utf8"), {
+    module, require, __dirname: path.dirname(modulePath), console,
+    Date: { now: () => now },
+    setTimeout(callback, delay) {
+      timers.set(++nextTimer, { callback, deadline: now + delay });
+      return nextTimer;
+    },
+    clearTimeout: timer => timers.delete(timer),
+    clearInterval,
+  });
+  const storage = storageFor(state(76));
+  const app = new EventEmitter();
+  app.getLocale = () => "en";
+  const frames = [];
+  let tooltip;
+  const tray = {
+    isDestroyed: () => false,
+    setImage: image => frames.push(image.name),
+    setToolTip: value => { tooltip = value; },
+  };
+  const nativeImage = { createFromPath: file => ({ name: path.basename(file), isEmpty: () => false }) };
+  const hooks = module.exports.attach({ tray, storage, nativeImage, originalImage: {}, app });
+  function update(device) {
+    storage.windowStorageMap = storageFor(device).windowStorageMap;
+    hooks.refresh();
+  }
+  try {
+    update(state(76, "off"));
+    update(state(100));
+    const context = { hn: tray, b: { windowStorage: storage, lang: "en" }, require: () => module.exports };
+    now += 1900;
+    vm.runInNewContext(TOOLTIP_INSERT, context);
+    hooks.refresh();
+    assert.deepEqual(frames, ["battery_080.ico"]);
+    assert.match(tooltip, /76% \(Last reported\)/);
+    assert.equal(timers.size, 1);
+    assert.equal(timers.values().next().value.deadline, 13000);
+    update(state(75));
+    assert.deepEqual(frames, ["battery_080.ico", "battery_075.ico"]);
+    assert.match(tooltip, /75%$/);
+    assert.equal(timers.size, 0);
+    update(state(75, "off"));
+    update(state(100));
+    const [id, { callback, deadline }] = timers.entries().next().value;
+    now = deadline;
+    timers.delete(id);
+    callback();
+    assert.equal(frames.at(-1), "battery_100.ico");
+    assert.match(tooltip, /100%$/);
+    assert.equal(timers.size, 0);
+  } finally {
+    hooks.dispose();
+  }
+});
+
 test("unknown archive inputs are rejected before any installation",()=>{
   assert.throws(()=>build(Buffer.from("unsupported")),/Unsupported/);
 });
